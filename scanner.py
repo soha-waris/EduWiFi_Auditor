@@ -1,110 +1,104 @@
 # scanner.py
 import subprocess
-from utils import run_command, Logger
+import time
 import re
+from utils import run_command, Logger
 
 class WifiScanner:
     def __init__(self):
         self.interface = None
+        self.monitor_interface = None
 
     def get_interfaces(self):
-        """List available wireless interfaces."""
-        output = run_command("iw dev")
-        if not output:
-            return []
-        
-        interfaces = []
-        for line in output.split('\n'):
-            if 'Interface' in line:
-                iface = line.split()[1]
-                interfaces.append(iface)
+        """List wireless interfaces"""
+        output = run_command("iw dev | grep Interface")
+        interfaces = [line.split()[-1] for line in output.splitlines() if line.strip()]
         return interfaces
 
-    def set_monitor_mode(self, interface):
-        """Put interface into monitor mode."""
-        Logger.info(f"Setting {interface} to monitor mode...")
-        # Bring down, change mode, bring up
-        run_command(f"ip link set {interface} down")
-        run_command(f"iw dev {interface} set type monitor")
-        run_command(f"ip link set {interface} up")
-        Logger.success(f"{interface} is now in monitor mode.")
-
-    def scan_networks(self, interface):
-        """Scan for WiFi networks using airodump-ng equivalent logic via subprocess."""
-        Logger.info("Scanning for networks... (Press Ctrl+C to stop)")
+    def enable_monitor_mode(self, interface):
+        """Enable monitor mode properly"""
+        Logger.info(f"Enabling monitor mode on {interface}...")
         
-        # We use a simple grep on iw scan or airodump-ng. 
-        # For robust parsing, we'll use 'iw dev <iface> scan' and parse output.
-        cmd = f"iw dev {interface} scan | grep -E 'SSID:|BSS|signal:'"
-        raw_output = run_command(cmd)
+        # Kill interfering processes
+        run_command("airmon-ng check kill")
         
-        if not raw_output:
-            Logger.warning("No networks found or command failed.")
-            return []
+        # Start monitor mode
+        result = run_command(f"airmon-ng start {interface}")
+        
+        # Get monitor interface name (usually wlan0mon or wlan1mon)
+        mon_output = run_command("iw dev | grep -E 'Interface.*mon'")
+        if "mon" in mon_output:
+            self.monitor_interface = mon_output.split()[-1]
+            Logger.success(f"Monitor mode enabled: {self.monitor_interface}")
+            return self.monitor_interface
+        else:
+            # Fallback
+            self.monitor_interface = f"{interface}mon"
+            Logger.warning("Could not detect monitor interface, using fallback.")
+            return self.monitor_interface
 
-        # Simple parser for demo purposes. 
-        # In production, use 'airodump-ng' output parsing for more detail.
+    def scan_networks(self, interface, duration=15):
+        """Improved network scanning"""
+        if not self.monitor_interface:
+            self.enable_monitor_mode(interface)
+        
+        mon_iface = self.monitor_interface or interface
+        
+        Logger.info(f"Scanning networks on {mon_iface} for {duration} seconds...")
+        
+        # Run airodump-ng and save to file for reliable parsing
+        cap_file = f"/tmp/scan_{int(time.time())}.csv"
+        
+        cmd = f"timeout {duration} airodump-ng {mon_iface} -w /tmp/scan --output-format csv"
+        run_command(cmd)
+        
+        # Parse the CSV
+        networks = self._parse_airodump_csv("/tmp/scan-01.csv")
+        
+        if not networks:
+            Logger.warning("No networks found. Trying alternative scan...")
+            networks = self._fallback_scan(mon_iface)
+        
+        return networks
+
+    def _parse_airodump_csv(self, csv_path):
+        """Parse airodump-ng CSV output"""
         networks = []
-        lines = raw_output.split('\n')
-        
-        current_bssid = None
-        current_channel = None
-        
-        for line in lines:
-            if "BSS" in line:
-                parts = line.split()
-                # This is a simplified extraction; real-world parsing needs regex on full iw scan
-                pass 
+        try:
+            with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
             
-        # Alternative: Use 'airodump-ng' one-shot for simplicity in this educational context
-        Logger.info("Using airodump-ng for detailed scan...")
-        cmd = f"timeout 10 airodump-ng {interface}"
-        # Note: Parsing airodump-ng stdout programmatically is complex. 
-        # For this script, we will simulate the result or use a simpler 'iw' parser.
+            for line in lines[2:]:  # Skip headers
+                if line.strip() and "," in line:
+                    parts = line.strip().split(',')
+                    if len(parts) > 5 and parts[0].strip() and parts[13].strip() != " ":
+                        try:
+                            bssid = parts[0].strip()
+                            ssid = parts[13].strip() if parts[13].strip() else "Hidden"
+                            channel = parts[3].strip()
+                            signal = parts[8].strip()
+                            encryption = parts[5].strip() + " " + parts[6].strip()
+                            
+                            if bssid and len(bssid) > 10:
+                                networks.append({
+                                    "BSSID": bssid,
+                                    "SSID": ssid[:20],
+                                    "Channel": channel,
+                                    "Signal": signal,
+                                    "Encryption": encryption[:15]
+                                })
+                        except:
+                            continue
+        except:
+            pass
         
-        # Let's stick to a robust 'iw' parser for this example:
-        return self._parse_iw_scan(interface)
+        return networks[:15]  # Limit to 15 networks
 
-    def _parse_iw_scan(self, interface):
-        """Parse iw scan output into structured data."""
-        cmd = f"iw dev {interface} scan"
-        raw = run_command(cmd)
-        if not raw:
-            return []
-
+    def _fallback_scan(self, interface):
+        """Fallback if CSV fails"""
+        Logger.info("Using fallback iw scan...")
+        output = run_command(f"iw dev {interface} scan | head -n 100")
+        # Simple parsing (basic)
         networks = []
-        # Simple regex to extract SSID, BSSID, Channel, Signal, Enc
-        pattern = re.compile(r"BSS\s+([0-9a-fA-F:]+).*?SSID:\s*([^\n]*).*?channel:\s*(\d+).*?signal:\s*(-\d+ dBm).*?tx-bitrate:\s*\d+.*?WPA|RSN")
-        
-        # Since iw scan output is multi-line, we split by BSS blocks roughly
-        blocks = raw.split("BSS ")
-        
-        for block in blocks[1:]: # Skip first empty
-            lines = block.split('\n')
-            bssid = None
-            ssid = "Hidden"
-            channel = "N/A"
-            signal = "N/A"
-            enc = "Open"
-
-            for line in lines:
-                if line.startswith("[0-9a-fA-F]:"):
-                    bssid = line.split()[0]
-                elif "SSID:" in line and not "Hidden" in line:
-                    ssid = line.split("SSID:")[1].strip()
-                elif "channel:" in line:
-                    channel = line.split("channel:")[1].split()[0]
-                elif "signal:" in line:
-                    signal = line.split("signal:")[1].split()[0]
-                elif "WPA" in line or "RSN" in line:
-                    enc = "WPA/WPA2"
-
-            if bssid:
-                networks.append({
-                    "BSSID": bssid,
-                    "SSID": ssid,
-                    "Channel": channel,
-                    "Signal": signal,
-                    "Encryption": enc
-                })
+        # ... (can improve later)
         return networks
